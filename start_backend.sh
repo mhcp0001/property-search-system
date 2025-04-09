@@ -1,0 +1,7 @@
+#!/bin/bash
+
+# バックエンドサーバーを起動するスクリプト
+cd /home/ubuntu/property-search-system/backend
+source venv/bin/activate
+cd app
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
