@@ -1,0 +1,215 @@
+以下に、先の詳細設計を一部修正・補足して、**「internet_providers ではプランを文字列で持つ」** および **「bike_parkings の distance は自前の位置情報APIを用いて算出」** する点を反映した最新版を提示します。
+
+---
+
+# システム詳細設計（修正版）
+
+## 1. システム構成概要
+
+- **Infrastructure**: Proxmox VE (v8.3.5)
+- **VM/Container数**: 3台 (Crawlerサーバ、Applicationサーバ、Databaseサーバ)
+- **言語・主要ソフトウェア**:  
+  - Python 3.9+  
+  - フレームワーク：FastAPI or Flask  
+  - DB：MySQL (8.x) または PostgreSQL (14.x 等)  
+- **主な役割**:  
+  - Crawlerサーバ：賃貸情報サイトのスクレイピング  
+  - Applicationサーバ：DB登録、インターネット回線プラン取得、バイク駐輪場検索、距離計算、LINE通知  
+  - Databaseサーバ：RDBMS (物件情報・インターネット回線プラン・バイク駐輪場データ等)
+
+---
+
+## 2. Databaseサーバ 詳細設計（修正版）
+
+以下は **MySQL** を例とし、PostgreSQL でも同様の構造を想定できます。
+
+### 2.1 テーブル設計
+
+#### 2.1.1 properties テーブル (物件情報)
+
+| フィールド名       | 型                  | 説明                                     | 備考                                 |
+|:-------------------|:--------------------|:-----------------------------------------|:--------------------------------------|
+| id (PK)            | BIGINT AUTO_INC     | 主キー                                   |                                       |
+| name               | VARCHAR(255)       | 物件名                                   |                                       |
+| address            | VARCHAR(255)       | 住所                                     |                                       |
+| latitude           | DECIMAL(9,6)       | 緯度 (例えば 35.123456 など)             | NULL可 (ジオコーディングで取得)       |
+| longitude          | DECIMAL(9,6)       | 経度                                     | NULL可 (ジオコーディングで取得)       |
+| station            | VARCHAR(255)       | 最寄り駅                                 |                                       |
+| walking_minutes    | INT                | 駅徒歩(分)                               |                                       |
+| rent               | INT                | 家賃（円）                               |                                       |
+| management_fee     | INT                | 管理費（円）                             | NULL可                                |
+| deposit            | INT                | 敷金（円）                               | NULL可                                |
+| key_money          | INT                | 礼金（円）                               | NULL可                                |
+| floor_plan         | VARCHAR(50)        | 間取り (1K, 1DK, 2LDK等)                |                                       |
+| size_sqm           | FLOAT              | 専有面積(㎡)                             |                                       |
+| building_structure | VARCHAR(50)        | 建物構造 (RC, SRC, 木造等)               |                                       |
+| built_year         | INT                | 築年 (西暦)                              |                                       |
+| total_floors       | INT                | 建物全体の階数                           | NULL可                                |
+| floor              | INT                | 部屋の所在階                             |                                       |
+| corner_room        | TINYINT(1)         | 角部屋フラグ (1:角部屋, 0:否)            |                                       |
+| status             | VARCHAR(20)        | 物件ステータス: NEW / NOTIFIED 等        |                                       |
+| site_url           | VARCHAR(500)       | スクレイピング元の詳細ページURL          |                                       |
+| main_image_url     | VARCHAR(500)       | 物件メイン画像URL                        | NULL可                                |
+| created_at         | DATETIME           | レコード作成日時                         | DEFAULT CURRENT_TIMESTAMP             |
+| updated_at         | DATETIME           | レコード更新日時                         | on update CURRENT_TIMESTAMP           |
+
+- **latitude / longitude**  
+  - バイク駐輪場との距離計算時に必要。  
+  - 住所をGoogle Geocoding API等でジオコーディングし、取得した値を登録。
+
+---
+
+#### 2.1.2 internet_providers テーブル (インターネット回線プラン)
+
+**要望**：「プランを文字列で持つ」形式に変更し、可否フラグではなく、具体的なプラン名・対応状況を格納します。
+
+| フィールド名  | 型               | 説明                                                 | 備考                          |
+|:-------------|:-----------------|:-----------------------------------------------------|:-----------------------------|
+| id (PK)      | BIGINT AUTO_INC  | 主キー                                               |                              |
+| property_id  | BIGINT           | properties.id（外部キー）                            |                              |
+| flets_plan   | VARCHAR(100)     | フレッツ光プラン名 (例:「フレッツ 光ネクスト マンションタイプ」など) | NULL可                       |
+| au_hikari_plan | VARCHAR(100)   | auひかりプラン名                                     | NULL可                       |
+| nuro_plan    | VARCHAR(100)     | NURO光プラン名                                       | NULL可                       |
+| jcom_plan    | VARCHAR(100)     | J:COMプラン名                                        | NULL可                       |
+| checked_at   | DATETIME         | チェック実施日時                                     |                              |
+
+- **プラン名の例**  
+  - フレッツ光：`"フレッツ 光ネクスト マンション・スーパーハイスピードタイプ隼"`  
+  - auひかり：`"auひかり マンションタイプX"`  
+  - NURO光：`"NURO光 for マンション"`  
+  - J:COM：`"J:COM NET 320M コース"`  
+- **不可の場合**  
+  - `"利用不可"`, `"未対応"` 等の文字列を登録  
+  - もしくはNULLにして「提供不可」とする運用も可  
+
+---
+
+#### 2.1.3 bike_parkings テーブル (近隣バイク駐輪場)
+
+**要望**：「distance は緯度経度から自前の位置情報APIで算出した値を格納したい」
+
+| フィールド名   | 型                | 説明                                                              | 備考                                     |
+|:--------------|:------------------|:------------------------------------------------------------------|:-----------------------------------------|
+| id (PK)       | BIGINT AUTO_INC   | 主キー                                                            |                                           |
+| property_id   | BIGINT            | properties.id（外部キー）                                         |                                           |
+| parking_name  | VARCHAR(255)      | 駐輪場名                                                          |                                           |
+| address       | VARCHAR(255)      | 駐輪場住所                                                        |                                           |
+| latitude      | DECIMAL(9,6)      | 駐輪場の緯度                                                      | NULL可 (検索サイトor独自APIで取得)       |
+| longitude     | DECIMAL(9,6)      | 駐輪場の経度                                                      | NULL可                                    |
+| distance      | FLOAT             | 物件からの距離 (km等)                                             | 自前の計算または外部APIで算出して保存     |
+| fee           | VARCHAR(50)       | 駐輪場利用料金                                                    | 取得可能なら登録                          |
+| parking_url   | VARCHAR(500)      | 詳細ページURL                                                     |                                           |
+| created_at    | DATETIME          | レコード作成日時                                                  | DEFAULT CURRENT_TIMESTAMP                 |
+
+- **distanceの算出**  
+  1. property(物件) の `(latitude, longitude)` と、駐輪場の `(latitude, longitude)` を取得  
+  2. `geopy` や `haversine` ライブラリを使用し、地球上の2点間距離(km)を計算  
+  3. 結果を `distance` に登録  
+- **駐輪場の緯度経度**  
+  - バイクパーク / 日本バイクパーキング等の公式サイトが提供する地図や住所を、ジオコーディングAPI(例: Google Geocoding, OpenStreetMap Nominatim)を用いて取得
+
+---
+
+#### 2.1.4 notifications テーブル (通知履歴) [任意]
+
+| フィールド名     | 型                | 説明                                            | 備考                             |
+|:----------------|:------------------|:------------------------------------------------|:---------------------------------|
+| id (PK)         | BIGINT AUTO_INC   | 主キー                                          |                                  |
+| property_id     | BIGINT            | properties.id（外部キー）                       |                                  |
+| notified_at     | DATETIME          | 通知実施日時                                    |                                  |
+| line_message_id | VARCHAR(255)      | LINEメッセージID等(必要に応じ)                  | NULL可                           |
+| created_at      | DATETIME          | レコード作成日時                                | DEFAULT CURRENT_TIMESTAMP        |
+
+- **物件テーブル側のstatus**と組み合わせて運用  
+  - 一度通知した物件は`properties.status = "NOTIFIED"`にする  
+  - さらに詳細履歴を管理したい場合にこのテーブルを使う  
+
+---
+
+## 3. Applicationサーバ（修正版）のポイント
+
+### 3.1 インターネット回線プラン登録
+
+- **Flow**  
+  1. 物件の住所やマンション名を用いてフレッツ光等の提供可否ページをスクレイピング。  
+  2. 結果（プラン名や「未対応」など）を文字列として取得。  
+  3. `internet_providers` テーブルに該当カラムに保存。  
+  4. 存在しない/不明の場合は `"未対応"` を入れるか、`NULL` を登録。
+
+### 3.2 バイク駐輪場の距離算出
+
+1. バイク駐輪場サイト（バイクパーク等）から「駐輪場住所」「地図リンク」を取得。  
+2. アプリケーション側で駐輪場住所をジオコーディング → `(latitude, longitude)` を得る。  
+3. 物件側にも `(latitude, longitude)` が登録されている前提。  
+4. `geopy.distance.distance((lat1, lng1), (lat2, lng2))` 等で距離(km)を算出。  
+5. `bike_parkings.distance` に保存。
+
+- **実装例** (Python, geopy)
+  ```python
+  from geopy.distance import distance
+
+  # 物件と駐輪場の緯度経度を取得 (float)
+  property_coords = (property_lat, property_lng)
+  parking_coords  = (parking_lat, parking_lng)
+
+  dist_km = distance(property_coords, parking_coords).km
+  ```
+
+### 3.3 LINE通知・物件情報表示
+
+- 通知メッセージには以下を含める想定:  
+  - 物件名 / 家賃 / 最寄り駅 / 画像URL / マップリンク (住所 or 緯度経度リンク)  
+- インターネット回線プランやバイク駐輪場リストは、通知フォーマットを拡張する際に追記（任意）。
+
+---
+
+## 4. 主要テーブル間のER図(イメージ)
+
+```
+properties (1) ---- (1) internet_providers
+         (1) ---- (N) bike_parkings
+         (1) ---- (N) notifications (option)
+```
+
+- **properties.id** をキーに、`internet_providers.property_id` が 1:1 の関係  
+- **properties.id** と `bike_parkings.property_id` が 1:多 の関係
+
+---
+
+## 5. 実装上の注意点
+
+1. **ジオコーディングAPIの制限**  
+   - 無料利用では1日あたりリクエスト数に制限がある場合が多い。  
+   - 物件数・駐輪場数が多い地域だと、レートリミットに注意しつつキャッシュを利用する。  
+2. **住所の正規化**  
+   - 物件住所・駐輪場住所ともに表記ゆれがあると正確にジオコーディングできない場合がある。  
+   - 「東京都新宿区歌舞伎町1-2-3」 → なるべく都道府県・市区町村・丁目・番地までしっかり正規化。  
+3. **スクレイピング先の変更対応**  
+   - インターネット回線各社ページやバイク駐輪場サイトはHTMLが変わる可能性がある。  
+   - 定期的なメンテナンス or アップデートが必要。  
+4. **DBインデックス**  
+   - 例：`properties` の `(name, address, floor)` あたりで重複判定用のUNIQUE INDEXを検討。  
+   - ジオコーディングした `(latitude, longitude)` で複合ジオインデックスを張り、高度な空間検索をするかは将来的検討。
+
+---
+
+## 6. まとめ
+
+- **internet_providers**:  
+  - フラグではなく **プラン名の文字列** を持ち、「未対応」「不明」といった文字列管理も可能。  
+- **bike_parkings.distance**:  
+  - **物件と駐輪場の緯度経度** を元に、自前の計算ロジック（geopy など）で算出した値を保存。  
+  - APIコール回数や表記ゆれを考慮してキャッシュやリトライ制御を導入。
+
+これにより、要望に合わせた回線プランの詳細表示と、駐輪場までの正確な距離計算が可能になります。  
+以後は本設計をもとに **実装→テスト→運用** へと進み、さらに追加要件や実際のデータ規模に応じてテーブル設計やインデックスの最適化を行ってください。
+
+---
+
+### ポイントまとめ
+1. **回線プランを文字列管理**：`internet_providers` テーブルで "フレッツ 光ネクストマンション○○プラン" のように詳細を記録。  
+2. **駐輪場の距離計算**：`bike_parkings.distance` は `(latitude, longitude)` 同士を比較して算出。  
+3. **DBスキーマで緯度経度列を用意**：物件と駐輪場それぞれに格納し、柔軟に距離計算・絞り込みが可能。  
+4. **メンテナンス性**：スクレイピング先やジオコーディングAPIの仕様変更に備え、エラーハンドリング・リトライを設計。
+
+本修正を加えた設計により、要件どおりのシステム実装が進められます。
